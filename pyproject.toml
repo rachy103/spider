@@ -20,7 +20,7 @@ dependencies = [
   "mediapy",
   "opencv-python",
   "newton[examples] @ git+https://github.com/newton-physics/newton.git",
-  "rerun-sdk",
+  "rerun-sdk==0.26.2",
   "ipdb",
   "pymeshlab",
   "open3d",

@@ -8,13 +8,17 @@ task: cat
 rerun_spawn: true
 ref_dt: 0.05
 max_sim_steps: -1
-horizon: 1.6
-ctrl_dt: 0.4
-knot_dt: 0.4
+horizon: 0.8
+ctrl_dt: 0.1
+knot_dt: 0.2
 num_dr: 1
 perturb_torque: 0.0
-pos_noise_scale: 0.03
+pos_noise_scale: 0.05
 rot_noise_scale: 0.05
-joint_noise_scale: 0.5
-improvement_threshold: 0.001
+joint_noise_scale: 0.1
+improvement_check_steps: 2
 max_num_iterations: 16
+temperature: 1.0
+# original reference is bad, so we put smaller scale on tracking wrist pose
+base_pos_rew_scale: 0.1
+base_rot_rew_scale: 0.03
