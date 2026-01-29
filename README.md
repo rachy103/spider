@@ -97,7 +97,18 @@ If you already have the example datasets cloned, you can skip the preprocessing 
 Run SPIDER on a processed trial:
 
 ```bash
-uv run examples/run_mjwp.py
+export TASK=p36-tea
+export HAND_TYPE=bimanual
+export DATA_ID=0
+export ROBOT_TYPE=xhand
+export DATASET_NAME=gigahand
+
+uv run examples/run_mjwp.py \
+  +override=${DATASET_NAME} \
+  task=${TASK} \
+  data_id=${DATA_ID} \
+  robot_type=${ROBOT_TYPE} \
+  embodiment_type=${HAND_TYPE}
 ```
 
 For full workflow, please refer to the [Workflow](#workflow) section.
