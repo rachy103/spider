@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import loguru
 import mujoco
 import mujoco_warp as mjwarp
 import numpy as np
@@ -179,16 +180,26 @@ def _weight_diff_qpos(config: Config) -> torch.Tensor:
         w[half_dof + 3 : half_dof + 6] = config.base_rot_rew_scale
         w[half_dof + 6 : config.nu] = config.joint_rew_scale
         # object
-        w[-12:-9] = config.pos_rew_scale
-        w[-9:-6] = config.rot_rew_scale
-        w[-6:-3] = config.pos_rew_scale
-        w[-3:] = config.rot_rew_scale
+        if config.nq_obj == 12:
+            w[-12:-9] = config.pos_rew_scale
+            w[-9:-6] = config.rot_rew_scale
+            w[-6:-3] = config.pos_rew_scale
+            w[-3:] = config.rot_rew_scale
+        else:
+            w[-14:-11] = config.pos_rew_scale
+            w[-11:-7] = config.rot_rew_scale
+            w[-7:-4] = config.pos_rew_scale
+            w[-4:] = config.rot_rew_scale
     elif config.embodiment_type in ["right", "left"]:
         w[:3] = config.base_pos_rew_scale
         w[3:6] = config.base_rot_rew_scale
         w[6 : config.nu] = config.joint_rew_scale
-        w[-6:-3] = config.pos_rew_scale
-        w[-3:] = config.rot_rew_scale
+        if config.nq_obj == 6:
+            w[-6:-3] = config.pos_rew_scale
+            w[-3:] = config.rot_rew_scale
+        else:
+            w[-7:-4] = config.pos_rew_scale
+            w[-4:] = config.rot_rew_scale
     elif config.embodiment_type in ["humanoid"]:  # humanoid robot
         # robot pos and rot
         w[:3] = config.pos_rew_scale
@@ -218,6 +229,13 @@ def _diff_qpos(
     batch_size = qpos_sim.shape[0]
     qpos_diff = torch.zeros((batch_size, config.nv), device=config.device)
     if config.embodiment_type == "bimanual":
+        if config.nq_obj == 12:
+            qpos_diff[:, :-12] = qpos_sim[:, :-12] - qpos_ref[:, :-12]
+            qpos_diff[:, -12:-9] = qpos_sim[:, -12:-9] - qpos_ref[:, -12:-9]
+            qpos_diff[:, -9:-6] = qpos_sim[:, -9:-6] - qpos_ref[:, -9:-6]
+            qpos_diff[:, -6:-3] = qpos_sim[:, -6:-3] - qpos_ref[:, -6:-3]
+            qpos_diff[:, -3:] = qpos_sim[:, -3:] - qpos_ref[:, -3:]
+            return qpos_diff
         # joint
         qpos_diff[:, :-12] = qpos_sim[:, :-14] - qpos_ref[:, :-14]
         # position
@@ -227,6 +245,11 @@ def _diff_qpos(
         qpos_diff[:, -9:-6] = quat_sub(qpos_sim[:, -11:-7], qpos_ref[:, -11:-7])
         qpos_diff[:, -3:] = quat_sub(qpos_sim[:, -4:], qpos_ref[:, -4:])
     elif config.embodiment_type in ["right", "left"]:
+        if config.nq_obj == 6:
+            qpos_diff[:, :-6] = qpos_sim[:, :-6] - qpos_ref[:, :-6]
+            qpos_diff[:, -6:-3] = qpos_sim[:, -6:-3] - qpos_ref[:, -6:-3]
+            qpos_diff[:, -3:] = qpos_sim[:, -3:] - qpos_ref[:, -3:]
+            return qpos_diff
         # joint
         qpos_diff[:, :-6] = qpos_sim[:, :-7] - qpos_ref[:, :-7]
         # position
@@ -345,6 +368,36 @@ def get_terminate(
     qpos_sim = wp.to_torch(env.data_wp.qpos)
     qpos_ref, qvel_ref, ctrl_ref, contact_ref, _contact_pos_ref = ref_slice
     if config.embodiment_type == "bimanual":
+        if config.nq_obj == 12:
+            right_obj_pos = qpos_sim[:, -12:-9]
+            right_obj_pos_ref = qpos_ref[-12:-9].unsqueeze(0)
+            right_obj_pos_error = torch.norm(
+                right_obj_pos - right_obj_pos_ref, p=2, dim=1
+            )
+            right_obj_rot = qpos_sim[:, -9:-6]
+            right_obj_rot_ref = qpos_ref[-9:-6].unsqueeze(0)
+            right_obj_rot_error = torch.norm(
+                right_obj_rot - right_obj_rot_ref, p=2, dim=1
+            )
+            left_obj_pos = qpos_sim[:, -6:-3]
+            left_obj_pos_ref = qpos_ref[-6:-3].unsqueeze(0)
+            left_obj_pos_error = torch.norm(left_obj_pos - left_obj_pos_ref, p=2, dim=1)
+            left_obj_rot = qpos_sim[:, -3:]
+            left_obj_rot_ref = qpos_ref[-3:].unsqueeze(0)
+            left_obj_rot_error = torch.norm(left_obj_rot - left_obj_rot_ref, p=2, dim=1)
+            if torch.all(right_obj_pos_ref.abs() < 1e-4):
+                right_obj_pos_error *= 0.0
+                right_obj_rot_error *= 0.0
+            if torch.all(left_obj_pos_ref.abs() < 1e-4):
+                left_obj_pos_error *= 0.0
+                left_obj_rot_error *= 0.0
+            terminate = (
+                (left_obj_pos_error > config.object_pos_threshold)
+                | (right_obj_pos_error > config.object_pos_threshold)
+                | (left_obj_rot_error > config.object_rot_threshold)
+                | (right_obj_rot_error > config.object_rot_threshold)
+            )
+            return terminate
         left_obj_pos = qpos_sim[:, -14:-11]
         left_obj_pos_ref = qpos_ref[-14:-11].unsqueeze(0)
         left_obj_pos_error = torch.norm(left_obj_pos - left_obj_pos_ref, p=2, dim=1)
@@ -380,6 +433,17 @@ def get_terminate(
             | (right_obj_quat_error > config.object_rot_threshold)
         )
     elif config.embodiment_type in ["right", "left"]:
+        if config.nq_obj == 6:
+            obj_pos = qpos_sim[:, -6:-3]
+            obj_pos_ref = qpos_ref[-6:-3].unsqueeze(0)
+            obj_pos_error = torch.norm(obj_pos - obj_pos_ref, p=2, dim=1)
+            obj_rot = qpos_sim[:, -3:]
+            obj_rot_ref = qpos_ref[-3:].unsqueeze(0)
+            obj_rot_error = torch.norm(obj_rot - obj_rot_ref, p=2, dim=1)
+            terminate = (obj_pos_error > config.object_pos_threshold) | (
+                obj_rot_error > config.object_rot_threshold
+            )
+            return terminate
         obj_pos = qpos_sim[:, -7:-4]
         obj_pos_ref = qpos_ref[-7:-4].unsqueeze(0)
         obj_pos_error = torch.norm(obj_pos - obj_pos_ref, p=2, dim=1)
@@ -430,6 +494,41 @@ def set_qpos(config: Config, env: MJWPEnv, qpos: torch.Tensor):
 
 def get_qvel(config: Config, env: MJWPEnv) -> torch.Tensor:
     return wp.to_torch(env.data_wp.qvel)
+
+
+def compute_contact_point_delta(
+    contact_mask_step: torch.Tensor,
+    contact_pos_ref_step: torch.Tensor,
+    site_xpos: torch.Tensor,
+    hand_contact_site_ids: list[int | None],
+    contact_indices: list[int],
+) -> torch.Tensor | None:
+    """Compute mean contact position delta for a hand (current - reference).
+
+    Args:
+        contact_mask_step: (N_contact,) mask for active contacts.
+        contact_pos_ref_step: (N_contact, 3) reference contact positions.
+        site_xpos: (N_site, 3) current site positions for the active world.
+        hand_contact_site_ids: list mapping contact indices to site ids (None if missing).
+        contact_indices: indices for the hand contacts to aggregate.
+    """
+    current_positions = []
+    reference_positions = []
+    for idx in contact_indices:
+        if idx >= len(hand_contact_site_ids) or idx >= contact_pos_ref_step.shape[0]:
+            continue
+        sid = hand_contact_site_ids[idx]
+        if sid is None or contact_mask_step[idx] <= 0.5:
+            continue
+        current_positions.append(site_xpos[sid])
+        reference_positions.append(contact_pos_ref_step[idx])
+
+    if not current_positions:
+        return None
+
+    current_mean = torch.stack(current_positions, dim=0).mean(dim=0)
+    reference_mean = torch.stack(reference_positions, dim=0).mean(dim=0)
+    return current_mean - reference_mean
 
 
 def get_trace(config: Config, env: MJWPEnv) -> torch.Tensor:
@@ -606,6 +705,67 @@ def load_env_params(config: Config, env: MJWPEnv, env_param: dict):
             )
 
         wp.copy(env.data_wp.qpos, wp.from_torch(qpos_override_th))
+
+    # update object actuator gains
+    if "kp" in env_param or "kd" in env_param:
+        actuator_ids = config.object_actuator_ids
+        if not actuator_ids:
+            loguru.logger.warning(
+                "Object actuator ids are empty; skipping kp/kd updates."
+            )
+        else:
+            kp = env_param.get("kp")
+            kd = env_param.get("kd")
+            if kp is None or kd is None:
+                loguru.logger.warning(
+                    "Both kp and kd are required to update actuator gains; skipping."
+                )
+            else:
+                kp_np = np.asarray(kp, dtype=np.float32)
+                kd_np = np.asarray(kd, dtype=np.float32)
+                if kp_np.ndim == 0:
+                    kp_np = np.full((len(actuator_ids),), kp_np, dtype=np.float32)
+                if kd_np.ndim == 0:
+                    kd_np = np.full((len(actuator_ids),), kd_np, dtype=np.float32)
+                if kp_np.shape[0] != len(actuator_ids) or kd_np.shape[0] != len(
+                    actuator_ids
+                ):
+                    raise ValueError(
+                        "kp/kd size mismatch for object actuators: "
+                        f"kp={kp_np.shape}, kd={kd_np.shape}, "
+                        f"expected={len(actuator_ids)}"
+                    )
+
+                # Update CPU model (used for viewer and as source of truth)
+                env.model_cpu.actuator_gainprm[actuator_ids, 0] = kp_np
+                env.model_cpu.actuator_biasprm[actuator_ids, 1] = -kd_np
+
+                # Propagate to MJWarp model if available
+                if hasattr(env.model_wp, "actuator_gainprm") and hasattr(
+                    env.model_wp, "actuator_biasprm"
+                ):
+                    gain_full = np.array(
+                        env.model_cpu.actuator_gainprm, dtype=np.float32
+                    )
+                    bias_full = np.array(
+                        env.model_cpu.actuator_biasprm, dtype=np.float32
+                    )
+                    wp.copy(
+                        env.model_wp.actuator_gainprm,
+                        wp.from_numpy(
+                            gain_full, dtype=wp.float32, device=config.device
+                        ),
+                    )
+                    wp.copy(
+                        env.model_wp.actuator_biasprm,
+                        wp.from_numpy(
+                            bias_full, dtype=wp.float32, device=config.device
+                        ),
+                    )
+                else:
+                    loguru.logger.warning(
+                        "MJWarp model has no actuator_gainprm/biasprm; updated CPU model only."
+                    )
 
     return env
 

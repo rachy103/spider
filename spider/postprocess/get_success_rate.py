@@ -16,12 +16,14 @@ import os
 import numpy as np
 import pandas as pd
 import tyro
+from scipy.spatial.transform import Rotation as R
 
 from spider import ROOT
 from spider.io import get_all_tasks, get_processed_data_dir
 
 DEFAULT_REF_DT = 0.02
 DEFAULT_SIM_DT = 0.01
+DEFAULT_ACT_SIM_DT = 0.005
 
 
 def quat_to_vel(quat: np.ndarray) -> np.ndarray:
@@ -104,16 +106,150 @@ def quat_sub(qa, qb):
     return quat_to_vel(qdif)
 
 
-def _load_task_dts(task_processed_dir: str, task_name: str) -> tuple[float, float]:
+def _euler_to_quat_wxyz(euler: np.ndarray) -> np.ndarray:
+    """Convert intrinsic Euler (xyz) angles to quaternion in (w, x, y, z) format."""
+    quat_xyzw = R.from_euler("XYZ", euler, degrees=False).as_quat()
+    quat_wxyz = np.empty_like(quat_xyzw)
+    quat_wxyz[..., 0] = quat_xyzw[..., 3]
+    quat_wxyz[..., 1:] = quat_xyzw[..., :3]
+    return quat_wxyz
+
+
+def compute_object_tracking_error(
+    qpos_traj: np.ndarray,
+    qpos_ref: np.ndarray,
+    embodiment_type: str,
+    data_type: str,
+) -> dict:
+    """Compute object position/quaternion tracking error for a trajectory."""
+    use_act = data_type.endswith("_act")
+    if embodiment_type == "bimanual":
+        if use_act:
+            qpos_object_right_traj = qpos_traj[:, -12:-6]
+            qpos_object_left_traj = qpos_traj[:, -6:]
+            qpos_object_right_ref = qpos_ref[:, -12:-6]
+            qpos_object_left_ref = qpos_ref[:, -6:]
+        else:
+            qpos_object_right_traj = qpos_traj[:, -14:-7]
+            qpos_object_left_traj = qpos_traj[:, -7:]
+            qpos_object_right_ref = qpos_ref[:, -14:-7]
+            qpos_object_left_ref = qpos_ref[:, -7:]
+
+        pos_object_right_traj = qpos_object_right_traj[:, :3]
+        pos_object_left_traj = qpos_object_left_traj[:, :3]
+        pos_object_right_ref = qpos_object_right_ref[:, :3]
+        pos_object_left_ref = qpos_object_left_ref[:, :3]
+
+        pos_object_right_traj = pos_object_right_traj - pos_object_right_traj.mean(
+            axis=0, keepdims=True
+        )
+        pos_object_left_traj = pos_object_left_traj - pos_object_left_traj.mean(
+            axis=0, keepdims=True
+        )
+        pos_object_right_ref = pos_object_right_ref - pos_object_right_ref.mean(
+            axis=0, keepdims=True
+        )
+        pos_object_left_ref = pos_object_left_ref - pos_object_left_ref.mean(
+            axis=0, keepdims=True
+        )
+
+        pos_err_right = np.linalg.norm(
+            pos_object_right_traj - pos_object_right_ref, axis=1
+        )
+        pos_err_left = np.linalg.norm(
+            pos_object_left_traj - pos_object_left_ref, axis=1
+        )
+
+        if use_act:
+            quat_right_traj = _euler_to_quat_wxyz(qpos_object_right_traj[:, 3:])
+            quat_right_ref = _euler_to_quat_wxyz(qpos_object_right_ref[:, 3:])
+            quat_left_traj = _euler_to_quat_wxyz(qpos_object_left_traj[:, 3:])
+            quat_left_ref = _euler_to_quat_wxyz(qpos_object_left_ref[:, 3:])
+        else:
+            quat_right_traj = qpos_object_right_traj[:, 3:]
+            quat_right_ref = qpos_object_right_ref[:, 3:]
+            quat_left_traj = qpos_object_left_traj[:, 3:]
+            quat_left_ref = qpos_object_left_ref[:, 3:]
+
+        quat_err_right = np.linalg.norm(
+            quat_sub(quat_right_traj, quat_right_ref), axis=1
+        )
+        quat_err_left = np.linalg.norm(quat_sub(quat_left_traj, quat_left_ref), axis=1)
+
+        quat_err_right = quat_err_right.mean()
+        quat_err_left = quat_err_left.mean()
+        pos_err_right = pos_err_right.mean()
+        pos_err_left = pos_err_left.mean()
+
+        left_mask = (
+            np.linalg.norm(pos_object_left_ref - pos_object_left_ref[:1], axis=1).mean()
+            < 0.001
+        )
+        right_mask = (
+            np.linalg.norm(
+                pos_object_right_ref - pos_object_right_ref[:1], axis=1
+            ).mean()
+            < 0.001
+        )
+        if left_mask:
+            obj_pos_err = pos_err_right
+            obj_quat_err = quat_err_right
+        elif right_mask:
+            obj_pos_err = pos_err_left
+            obj_quat_err = quat_err_left
+        else:
+            obj_pos_err = (pos_err_right + pos_err_left) / 2
+            obj_quat_err = (quat_err_right + quat_err_left) / 2
+    else:
+        if use_act:
+            qpos_object_traj = qpos_traj[:, -6:]
+            qpos_object_ref = qpos_ref[:, -6:]
+        else:
+            qpos_object_traj = qpos_traj[:, -7:]
+            qpos_object_ref = qpos_ref[:, -7:]
+
+        pos_object_traj = qpos_object_traj[:, :3]
+        pos_object_ref = qpos_object_ref[:, :3]
+
+        if use_act:
+            quat_traj = _euler_to_quat_wxyz(qpos_object_traj[:, 3:])
+            quat_ref = _euler_to_quat_wxyz(qpos_object_ref[:, 3:])
+        else:
+            quat_traj = qpos_object_traj[:, 3:]
+            quat_ref = qpos_object_ref[:, 3:]
+
+        obj_pos_err = np.linalg.norm(pos_object_traj - pos_object_ref, axis=1).mean()
+        obj_quat_err = np.linalg.norm(quat_sub(quat_traj, quat_ref), axis=1).mean()
+
+        pos_err_right = obj_pos_err if embodiment_type == "right" else 0.0
+        pos_err_left = obj_pos_err if embodiment_type == "left" else 0.0
+        quat_err_right = obj_quat_err if embodiment_type == "right" else 0.0
+        quat_err_left = obj_quat_err if embodiment_type == "left" else 0.0
+
+    return {
+        "obj_pos_err": obj_pos_err,
+        "obj_quat_err": obj_quat_err,
+        "pos_err_right": pos_err_right,
+        "pos_err_left": pos_err_left,
+        "quat_err_right": quat_err_right,
+        "quat_err_left": quat_err_left,
+    }
+
+
+def _load_task_dts(
+    task_processed_dir: str, task_name: str
+) -> tuple[float, float, float]:
     task_info_path = os.path.join(task_processed_dir, "task_info.json")
     ref_dt = DEFAULT_REF_DT
     sim_dt = DEFAULT_SIM_DT
+    act_sim_dt = DEFAULT_ACT_SIM_DT
     if not os.path.exists(task_info_path):
         print(
             f"Warning: task_info.json not found for {task_name} at {task_info_path}; "
-            f"using defaults ref_dt={DEFAULT_REF_DT}, sim_dt={DEFAULT_SIM_DT}"
+            f"using defaults ref_dt={DEFAULT_REF_DT}, sim_dt={DEFAULT_SIM_DT}, "
+            f"act_sim_dt={DEFAULT_ACT_SIM_DT}"
         )
-        return ref_dt, sim_dt
+        return ref_dt, sim_dt, act_sim_dt
 
     try:
         with open(task_info_path) as f:
@@ -121,9 +257,10 @@ def _load_task_dts(task_processed_dir: str, task_name: str) -> tuple[float, floa
     except Exception as e:
         print(
             f"Warning: failed to read {task_info_path} ({e}); "
-            f"using defaults ref_dt={DEFAULT_REF_DT}, sim_dt={DEFAULT_SIM_DT}"
+            f"using defaults ref_dt={DEFAULT_REF_DT}, sim_dt={DEFAULT_SIM_DT}, "
+            f"act_sim_dt={DEFAULT_ACT_SIM_DT}"
         )
-        return ref_dt, sim_dt
+        return ref_dt, sim_dt, act_sim_dt
 
     if "ref_dt" not in task_info:
         print(
@@ -141,7 +278,15 @@ def _load_task_dts(task_processed_dir: str, task_name: str) -> tuple[float, floa
     else:
         sim_dt = float(task_info["sim_dt"])
 
-    return ref_dt, sim_dt
+    if "act_sim_dt" not in task_info:
+        print(
+            f"Warning: act_sim_dt missing in {task_info_path}; "
+            f"using default act_sim_dt={DEFAULT_ACT_SIM_DT}"
+        )
+    else:
+        act_sim_dt = float(task_info["act_sim_dt"])
+
+    return ref_dt, sim_dt, act_sim_dt
 
 
 def _get_downsample_factor(ref_dt: float, sim_dt: float) -> int:
@@ -163,9 +308,13 @@ def main(
     pos_err_threshold: float = 0.1,
     quat_err_threshold: float = 0.5,
     data_id_list: list[int] = None,
+    sim_dt: float | None = None,
+    ref_dt: float | None = None,
 ):
     # resolve paths using the new structure
     dataset_dir = os.path.abspath(dataset_dir)
+
+    use_act = data_type.endswith("_act")
 
     all_tasks = get_all_tasks(
         dataset_dir=dataset_dir,
@@ -186,7 +335,13 @@ def main(
         if not os.path.isdir(task_processed_dir):
             print(f"Warning: task directory not found: {task_processed_dir}")
             continue
-        ref_dt, sim_dt = _load_task_dts(task_processed_dir, task_name)
+        task_ref_dt, task_sim_dt, task_act_sim_dt = _load_task_dts(
+            task_processed_dir, task_name
+        )
+        task_ref_dt = ref_dt if ref_dt is not None else task_ref_dt
+        if use_act:
+            task_sim_dt = task_act_sim_dt
+        task_sim_dt = sim_dt if sim_dt is not None else task_sim_dt
 
         # Get all data_id directories within the task
         if data_id_list is None:
@@ -229,7 +384,12 @@ def main(
                     raise ValueError(f"Invalid trajectory dimension: {qpos_traj.ndim}")
 
                 # For comparison, we need a reference trajectory (kinematic IK result)
-                kinematic_file = f"{processed_dir_robot}/trajectory_kinematic.npz"
+                if data_type.endswith("_act"):
+                    kinematic_file = (
+                        f"{processed_dir_robot}/trajectory_kinematic_act.npz"
+                    )
+                else:
+                    kinematic_file = f"{processed_dir_robot}/trajectory_kinematic.npz"
                 if not os.path.exists(kinematic_file):
                     print(
                         f"Warning: kinematic reference file not found: {kinematic_file}"
@@ -240,7 +400,7 @@ def main(
                 qpos_kinematic = kinematic_data["qpos"]
 
                 # Downsample sim trajectory to match reference dt
-                downsample_factor = _get_downsample_factor(ref_dt, sim_dt)
+                downsample_factor = _get_downsample_factor(task_ref_dt, task_sim_dt)
                 if downsample_factor > 1:
                     qpos_traj = qpos_traj[::downsample_factor]
 
@@ -255,118 +415,15 @@ def main(
                 print(f"Error loading trajectory data for {task_name}/{data_id}: {e}")
                 continue
 
-            # compute object tracking error
-            if embodiment_type == "bimanual":
-                # get object qpos for both trajectories
-                qpos_object_right_traj = qpos_traj[:, -14:-7]
-                qpos_object_left_traj = qpos_traj[:, -7:]
-                qpos_object_right_kinematic = qpos_kinematic[:, -14:-7]
-                qpos_object_left_kinematic = qpos_kinematic[:, -7:]
-
-                # get pos and quat
-                pos_object_right_traj = qpos_object_right_traj[:, :3]
-                pos_object_right_traj = (
-                    pos_object_right_traj
-                    - pos_object_right_traj.mean(axis=0, keepdims=True)
-                )
-                quat_wxyz_object_right_traj = qpos_object_right_traj[:, 3:]
-                pos_object_left_traj = qpos_object_left_traj[:, :3]
-                pos_object_left_traj = pos_object_left_traj - pos_object_left_traj.mean(
-                    axis=0, keepdims=True
-                )
-                quat_wxyz_object_left_traj = qpos_object_left_traj[:, 3:]
-
-                pos_object_right_kinematic = qpos_object_right_kinematic[:, :3]
-                pos_object_right_kinematic = (
-                    pos_object_right_kinematic
-                    - pos_object_right_kinematic.mean(axis=0, keepdims=True)
-                )
-                quat_wxyz_object_right_kinematic = qpos_object_right_kinematic[:, 3:]
-                pos_object_left_kinematic = qpos_object_left_kinematic[:, :3]
-                pos_object_left_kinematic = (
-                    pos_object_left_kinematic
-                    - pos_object_left_kinematic.mean(axis=0, keepdims=True)
-                )
-                quat_wxyz_object_left_kinematic = qpos_object_left_kinematic[:, 3:]
-
-                # compute pos error
-                pos_err_right = np.linalg.norm(
-                    pos_object_right_traj - pos_object_right_kinematic, axis=1
-                )
-                pos_err_left = np.linalg.norm(
-                    pos_object_left_traj - pos_object_left_kinematic, axis=1
-                )
-                quat_err_right = np.linalg.norm(
-                    quat_sub(
-                        quat_wxyz_object_right_traj, quat_wxyz_object_right_kinematic
-                    ),
-                    axis=1,
-                )
-                quat_err_left = np.linalg.norm(
-                    quat_sub(
-                        quat_wxyz_object_left_traj, quat_wxyz_object_left_kinematic
-                    ),
-                    axis=1,
-                )
-
-                quat_err_right = quat_err_right.mean()
-                quat_err_left = quat_err_left.mean()
-                pos_err_right = pos_err_right.mean()
-                pos_err_left = pos_err_left.mean()
-
-                # compute average pos and quat error (handle the case where the object is a place holder)
-                # if pos_object_right_kinematic close to 0, then only use left
-                # if pos_object_left_kinematic close to 0, then only use right
-                # otherwise, use both
-                left_mask = (
-                    np.linalg.norm(
-                        pos_object_left_kinematic - pos_object_left_kinematic[:1],
-                        axis=1,
-                    ).mean()
-                    < 0.001
-                )
-                right_mask = (
-                    np.linalg.norm(
-                        pos_object_right_kinematic - pos_object_right_kinematic[:1],
-                        axis=1,
-                    ).mean()
-                    < 0.001
-                )
-                if left_mask:
-                    obj_pos_err = pos_err_right
-                    obj_quat_err = quat_err_right
-                elif right_mask:
-                    obj_pos_err = pos_err_left
-                    obj_quat_err = quat_err_left
-                else:
-                    obj_pos_err = (pos_err_right + pos_err_left) / 2
-                    obj_quat_err = (quat_err_right + quat_err_left) / 2
-
-            else:  # single hand case
-                # get object qpos for single hand
-                qpos_object_traj = qpos_traj[:, -7:]
-                qpos_object_kinematic = qpos_kinematic[:, -7:]
-
-                # get pos and quat
-                pos_object_traj = qpos_object_traj[:, :3]
-                quat_wxyz_object_traj = qpos_object_traj[:, 3:]
-                pos_object_kinematic = qpos_object_kinematic[:, :3]
-                quat_wxyz_object_kinematic = qpos_object_kinematic[:, 3:]
-
-                # compute pos and quat error
-                obj_pos_err = np.linalg.norm(
-                    pos_object_traj - pos_object_kinematic, axis=1
-                )
-                obj_quat_err = np.linalg.norm(
-                    quat_sub(quat_wxyz_object_traj, quat_wxyz_object_kinematic), axis=1
-                )
-                obj_pos_err = obj_pos_err.mean()
-                obj_quat_err = obj_quat_err.mean()
-
-                pos_err_right = obj_pos_err if embodiment_type == "right" else 0.0
-                pos_err_left = obj_pos_err if embodiment_type == "left" else 0.0
-                quat_err_right = obj_quat_err if embodiment_type == "right" else 0.0
-                quat_err_left = obj_quat_err if embodiment_type == "left" else 0.0
+            errors = compute_object_tracking_error(
+                qpos_traj, qpos_kinematic, embodiment_type, data_type
+            )
+            obj_pos_err = errors["obj_pos_err"]
+            obj_quat_err = errors["obj_quat_err"]
+            pos_err_right = errors["pos_err_right"]
+            pos_err_left = errors["pos_err_left"]
+            quat_err_right = errors["quat_err_right"]
+            quat_err_left = errors["quat_err_left"]
 
             # compute success
             success = (obj_pos_err <= pos_err_threshold) & (

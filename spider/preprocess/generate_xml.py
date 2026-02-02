@@ -6,6 +6,7 @@
 
 import json
 import os
+import xml.etree.ElementTree as ET
 
 import loguru
 import mujoco
@@ -18,6 +19,91 @@ from spider import ROOT
 from spider.io import get_processed_data_dir
 
 
+def _format_float(value: float) -> str:
+    return f"{value:.6g}"
+
+
+def _add_object_xyzrpy_actuators(
+    xml_text: str,
+    object_armature: float,
+    object_frictionloss: float,
+    object_pos_kp: float,
+    object_pos_kd: float,
+    object_rot_kp: float,
+    object_rot_kd: float,
+) -> str:
+    root = ET.fromstring(xml_text)
+    worldbody = root.find("worldbody")
+    if worldbody is None:
+        return xml_text
+
+    actuator = root.find("actuator")
+    if actuator is None:
+        actuator = ET.SubElement(root, "actuator")
+
+    existing_actuators = {
+        elem.get("name")
+        for elem in actuator.findall("*")
+        if elem.get("name") is not None
+    }
+
+    joint_defs = [
+        ("pos_x", "slide", "1 0 0", "pos"),
+        ("pos_y", "slide", "0 1 0", "pos"),
+        ("pos_z", "slide", "0 0 1", "pos"),
+        ("rot_x", "hinge", "1 0 0", "rot"),
+        ("rot_y", "hinge", "0 1 0", "rot"),
+        ("rot_z", "hinge", "0 0 1", "rot"),
+    ]
+
+    for side in ("right", "left"):
+        body = worldbody.find(f".//body[@name='{side}_object']")
+        if body is None:
+            continue
+        free_joint_name = f"{side}_object_joint"
+        free_joint = None
+        for joint in body.findall("joint"):
+            if joint.get("name") == free_joint_name:
+                free_joint = joint
+                break
+        if free_joint is None:
+            continue
+
+        body_children = list(body)
+        insert_index = body_children.index(free_joint)
+        body.remove(free_joint)
+
+        for offset, (suffix, joint_type, axis, group) in enumerate(joint_defs):
+            joint_name = f"{side}_object_{suffix}"
+            joint_attrs = {
+                "name": joint_name,
+                "type": joint_type,
+                "axis": axis,
+                "armature": _format_float(object_armature),
+                "frictionloss": _format_float(object_frictionloss),
+            }
+            body.insert(insert_index + offset, ET.Element("joint", joint_attrs))
+
+            actuator_name = joint_name
+            if actuator_name not in existing_actuators:
+                kp = object_pos_kp if group == "pos" else object_rot_kp
+                kd = object_pos_kd if group == "pos" else object_rot_kd
+                actuator_attrs = {
+                    "name": actuator_name,
+                    "joint": joint_name,
+                    "kp": _format_float(kp),
+                    "kv": _format_float(kd),
+                }
+                actuator.append(ET.Element("position", actuator_attrs))
+                existing_actuators.add(actuator_name)
+
+    try:
+        ET.indent(root, space="  ")
+    except AttributeError:
+        pass
+    return ET.tostring(root, encoding="unicode")
+
+
 def main(
     dataset_dir: str = f"{ROOT}/../example_datasets",
     dataset_name: str = "oakink",
@@ -26,10 +112,15 @@ def main(
     task: str = "pick_spoon_bowl",
     data_id: int = 0,
     hand_floor_collision: bool = False,
+    object_floor_collision: bool = True,
+    object_object_collision: bool = True,
     object_density: float = 1000,
+    use_visual_mesh_as_collision: bool = False,
     object_armature: float = 0.0001,
     object_frictionloss: float = 0.0001,
+    friction_scale: float = 1.0,
     show_viewer: bool = True,
+    act_scene: bool = False,
 ):
     dataset_dir = os.path.abspath(dataset_dir)
     processed_dir = get_processed_data_dir(
@@ -172,40 +263,6 @@ def main(
     left_mesh_dir = task_info.get("left_object_mesh_dir")
     left_mesh_dir = f"{dataset_dir}/{left_mesh_dir}"
 
-    # Right object meshes
-    if (
-        embodiment_type in ["right", "bimanual"]
-        and right_convex_dir
-        and os.path.isdir(right_convex_dir)
-    ):
-        right_object_files = sorted(
-            [f for f in os.listdir(right_convex_dir) if f.endswith(".obj")]
-        )
-        for f in right_object_files:
-            suffix = f.split(".")[0]
-            file_abs = f"{right_convex_dir}/{f}"
-            file_rel_to_meshdir = os.path.relpath(file_abs, assets_root_dir)
-            mj_spec.add_mesh(name=f"right_{suffix}", file=file_rel_to_meshdir)
-    else:
-        right_object_files = []
-
-    # Left object meshes
-    if (
-        embodiment_type in ["left", "bimanual"]
-        and left_convex_dir
-        and os.path.isdir(left_convex_dir)
-    ):
-        left_object_files = sorted(
-            [f for f in os.listdir(left_convex_dir) if f.endswith(".obj")]
-        )
-        for f in left_object_files:
-            suffix = f.split(".")[0]
-            file_abs = f"{left_convex_dir}/{f}"
-            file_rel_to_meshdir = os.path.relpath(file_abs, assets_root_dir)
-            mj_spec.add_mesh(name=f"left_{suffix}", file=file_rel_to_meshdir)
-    else:
-        left_object_files = []
-
     # Visual meshes (non-colliding)
     right_visual_file = f"{right_mesh_dir}/visual.obj" if right_mesh_dir else None
     left_visual_file = f"{left_mesh_dir}/visual.obj" if left_mesh_dir else None
@@ -224,6 +281,40 @@ def main(
         file_rel_to_meshdir = os.path.relpath(left_visual_file, assets_root_dir)
         mj_spec.add_mesh(name="left_visual", file=file_rel_to_meshdir)
 
+    # Right object meshes
+    right_object_files = []
+    if embodiment_type in ["right", "bimanual"]:
+        if use_visual_mesh_as_collision and right_visual_file:
+            if os.path.exists(right_visual_file):
+                # Reuse the visual mesh for collision (no extra collision mesh).
+                right_object_files = ["visual"]
+        elif right_convex_dir and os.path.isdir(right_convex_dir):
+            right_object_files = sorted(
+                [f for f in os.listdir(right_convex_dir) if f.endswith(".obj")]
+            )
+            for f in right_object_files:
+                suffix = f.split(".")[0]
+                file_abs = f"{right_convex_dir}/{f}"
+                file_rel_to_meshdir = os.path.relpath(file_abs, assets_root_dir)
+                mj_spec.add_mesh(name=f"right_{suffix}", file=file_rel_to_meshdir)
+
+    # Left object meshes
+    left_object_files = []
+    if embodiment_type in ["left", "bimanual"]:
+        if use_visual_mesh_as_collision and left_visual_file:
+            if os.path.exists(left_visual_file):
+                # Reuse the visual mesh for collision (no extra collision mesh).
+                left_object_files = ["visual"]
+        elif left_convex_dir and os.path.isdir(left_convex_dir):
+            left_object_files = sorted(
+                [f for f in os.listdir(left_convex_dir) if f.endswith(".obj")]
+            )
+            for f in left_object_files:
+                suffix = f.split(".")[0]
+                file_abs = f"{left_convex_dir}/{f}"
+                file_rel_to_meshdir = os.path.relpath(file_abs, assets_root_dir)
+                mj_spec.add_mesh(name=f"left_{suffix}", file=file_rel_to_meshdir)
+
     # add object to model
     right_object_collision_names = []
     if embodiment_type in ["right", "bimanual"]:
@@ -240,17 +331,21 @@ def main(
         # add geom to object
         for obj_file in right_object_files:
             suffix = obj_file.split(".")[0]
-            if suffix.isdigit():
+            is_visual_collision = use_visual_mesh_as_collision and suffix == "visual"
+            geom_name = f"right_object_{suffix}"
+            if suffix.isdigit() or is_visual_collision:
                 rgba = [0, 1, 0, 1]
                 density = object_density
-                right_object_collision_names.append(f"right_object_{suffix}")
+                if is_visual_collision:
+                    geom_name = "right_object_collision_visual"
+                right_object_collision_names.append(geom_name)
                 group = 3
             else:
                 rgba = [1, 1, 1, 1]
                 density = 0
                 group = 0
             right_object_handle.add_geom(
-                name=f"right_object_{suffix}",
+                name=geom_name,
                 type=mujoco.mjtGeom.mjGEOM_MESH,
                 meshname=f"right_{suffix}",
                 pos=[0, 0, 0],
@@ -344,17 +439,21 @@ def main(
         # add geom to object
         for obj_file in left_object_files:
             suffix = obj_file.split(".")[0]
-            if suffix.isdigit():
+            is_visual_collision = use_visual_mesh_as_collision and suffix == "visual"
+            geom_name = f"left_object_{suffix}"
+            if suffix.isdigit() or is_visual_collision:
                 rgba = [0, 1, 0, 1]
                 density = object_density
-                left_object_collision_names.append(f"left_object_{suffix}")
+                if is_visual_collision:
+                    geom_name = "left_object_collision_visual"
+                left_object_collision_names.append(geom_name)
                 group = 3
             else:
                 rgba = [1, 1, 1, 1]
                 density = 0
                 group = 0
             left_object_handle.add_geom(
-                name=f"left_object_{suffix}",
+                name=geom_name,
                 type=mujoco.mjtGeom.mjGEOM_MESH,
                 meshname=f"left_{suffix}",
                 pos=[0, 0, 0],
@@ -452,8 +551,20 @@ def main(
 
     # add contact pairs
     default_solref = [0.02, 1]
-    default_friction = [1.0, 1.0, 0.1, 0.0, 0.0]
-    small_friction = [0.01, 0.01, 0.0001, 0.0, 0.0]
+    default_friction = [
+        1.0 * friction_scale,
+        1.0 * friction_scale,
+        0.1 * friction_scale,
+        0.0,
+        0.0,
+    ]
+    small_friction = [
+        0.01 * friction_scale,
+        0.01 * friction_scale,
+        0.0001 * friction_scale,
+        0.0,
+        0.0,
+    ]
     # [thumb, index intermediate, index, middle, ring, pinky + floor] <-> object
     hand_collision_names = []
     for geom_id in range(len(mj_spec.geoms)):
@@ -500,7 +611,11 @@ def main(
     #             "left_pinky_collision",
     #         ]
     #     )
-    hand_collision_names.append("floor")
+    hand_collision_names_for_object = (
+        hand_collision_names + ["floor"]
+        if object_floor_collision
+        else hand_collision_names
+    )
 
     object_names = []
     if embodiment_type in ["left", "bimanual"]:
@@ -523,7 +638,7 @@ def main(
 
     # hand <-> object collision
     for object_collision_name in object_collision_names:
-        for hand_collision_name in hand_collision_names:
+        for hand_collision_name in hand_collision_names_for_object:
             if "thumb" in hand_collision_name or "index" in hand_collision_name:
                 condim = 4
             else:
@@ -546,7 +661,8 @@ def main(
 
     # object <-> object collision
     if (
-        embodiment_type == "bimanual"
+        object_object_collision
+        and embodiment_type == "bimanual"
         and len(right_object_collision_names) > 0
         and len(left_object_collision_names) > 0
     ):
@@ -699,9 +815,27 @@ def main(
     # save model in processed dir, use a stable name
     xml_file = mj_spec.to_xml()
     export_file_path = f"{processed_dir}/../scene.xml"
-    with open(export_file_path, "w") as f:
-        f.write(xml_file)
-    loguru.logger.info(f"Saved model to {export_file_path}")
+    if not act_scene:
+        with open(export_file_path, "w") as f:
+            f.write(xml_file)
+        loguru.logger.info(f"Saved model to {export_file_path}")
+
+    if act_scene:
+        xml_file_act = _add_object_xyzrpy_actuators(
+            xml_file,
+            object_armature=object_armature,
+            object_frictionloss=object_frictionloss,
+            object_pos_kp=0,
+            object_pos_kd=0,
+            object_rot_kp=0,
+            object_rot_kd=0,
+        )
+        export_file_path_act = f"{processed_dir}/../scene_act.xml"
+        with open(export_file_path_act, "w") as f:
+            f.write(xml_file_act)
+        loguru.logger.info(
+            f"Saved model with object actuators to {export_file_path_act}"
+        )
 
     # save another model with has equality constraints between track site and ref site
     for sid in range(mj_model.nsite):
@@ -723,11 +857,12 @@ def main(
     mj_model_eq = mj_spec.compile()
     xml_file_eq = mj_spec.to_xml()
     export_file_path_eq = f"{processed_dir}/../scene_eq.xml"
-    with open(export_file_path_eq, "w") as f:
-        f.write(xml_file_eq)
-    loguru.logger.info(
-        f"Saved model with equality constraints to {export_file_path_eq}"
-    )
+    if not act_scene:
+        with open(export_file_path_eq, "w") as f:
+            f.write(xml_file_eq)
+        loguru.logger.info(
+            f"Saved model with equality constraints to {export_file_path_eq}"
+        )
 
     # save task info
     task_info["robot_type"] = robot_type

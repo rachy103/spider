@@ -29,13 +29,13 @@ from spider.viewers import viser_viewer as viser_viewer
 
 def setup_viewer(config: Config, mj_model: mujoco.MjModel, mj_data: mujoco.MjData):
     """Setup the viewer for the retargeting."""
-    viewer_str = config.viewer.lower()
+    viewer_str = (config.viewer or "").lower()
+    if not config.show_viewer:
+        viewer_str = ""
     use_rerun = "rerun" in viewer_str
     use_viser = "viser" in viewer_str
     if use_rerun and use_viser:
-        loguru.logger.warning(
-            "Both rerun and viser requested; defaulting to rerun."
-        )
+        loguru.logger.warning("Both rerun and viser requested; defaulting to rerun.")
         use_viser = False
 
     if use_rerun:
@@ -140,7 +140,9 @@ def update_viewer(
     mj_data_ref: mujoco.MjData,
     info: dict,
 ):
-    viewer_str = config.viewer.lower()
+    viewer_str = (config.viewer or "").lower()
+    if not config.show_viewer:
+        viewer_str = ""
     use_rerun = "rerun" in viewer_str
     use_viser = "viser" in viewer_str and not use_rerun
 

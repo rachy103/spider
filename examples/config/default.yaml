@@ -27,7 +27,7 @@ horizon: 1.6 # planning horizon
 knot_dt: 0.4 # knot point spacing
 max_sim_steps: -1 # maximum simulation steps (-1 for unlimited)
 # Simulation constraints
-nconmax_per_env: 100 # max contacts per environment
+nconmax_per_env: 120 # max contacts per environment
 njmax_per_env: 350 # max joints per environment
 # Simulation annealing
 num_dyn: 1 # number of environments for annealing, used for virtual contact constraint
@@ -37,6 +37,7 @@ pair_margin_range: [-0.005, 0.005]
 xy_offset_range: [-0.005, 0.005]
 perturb_force: 0.0
 perturb_torque: 0.0
+contact_guidance: false
 
 # === OPTIMIZER CONFIGURATION ===
 # Sampling parameters
@@ -67,6 +68,8 @@ terminal_rew_scale: 1.0
 terminate_resample: false
 object_pos_threshold: 0.1 # meters
 object_rot_threshold: 0.3 # radians
+# Gibbs sampling
+gibbs_sampling: false
 
 # === VISUALIZATION CONFIGURATION ===
 show_viewer: true
